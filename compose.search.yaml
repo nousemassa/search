@@ -1,0 +1,103 @@
+# Проект `search`: свой инстанс поиска и своя MCP-обёртка.
+#
+# **Почему отдельный проект.** Поиск — служба общего назначения: политику движков, таймауты и лимиты
+# MCP-сессий задаём мы. Своя папка, свой композ и своё имя проекта дают отдельную единицу управления
+# (метки, пересоздание, откат) и не связывают поиск с жизненным циклом любого продукта.
+#
+# Использование:
+#   1) поднять:    bash search-up.sh            (и `status`, `stop` — см. скрипт)
+#   2) проверить:  bash search-up.sh status     (JSON-поиск и инструменты MCP)
+#
+# **Почему свой инстанс.** Политику движков, таймауты и лимиты MCP-сессий задаём мы, а не чужой стек:
+# набор движков зафиксирован в `./searxng/settings.yml`, лимиты обёртки — осознанные.
+
+name: search
+
+networks:
+  #: Сеть ОБЩАЯ и создаётся ВНЕ проекта, поэтому `external: true`: своя сеть изолировала бы службы от
+  #: тех, кто приходит к ним по имени.
+  platform:
+    external: true
+    name: ${PLATFORM_NETWORK:?PLATFORM_NETWORK не задан — имя общей сети платформы}
+
+volumes:
+  #: Имя тома задано ЯВНО, а не по имени проекта: объявленный без `name:` том получает префикс проекта, и
+  #: смена имени создала бы НОВЫЙ ПУСТОЙ том, а старый остался бы висеть — «переезд» молча обнулил бы
+  #: состояние. Здесь состояние — только кеш поиска, поэтому потеря ограничена кешем.
+  searxng-cache:
+    name: search-cache
+
+services:
+  # Поиск: свой инстанс, политика движков — из репозитория.
+  searxng:
+    image: searxng/searxng@sha256:f433294b46a93564993c4371005341e013d94aa8ea4662d8ee521cd2cccb08e8
+    restart: unless-stopped
+    environment:
+      #: Секрет — здесь, а не в `settings.yml`: он перекрывает `server.secret_key`
+      #: (`SettingsValue(environ_name='SEARXNG_SECRET')`), поэтому в git попадает только шаблон.
+      #: ❗ Публикационный образец: значение ОБЯЗАТЕЛЬНО в `.env`, умолчания-заглушки нет — иначе стенд
+      #: молча поднялся бы с общеизвестным ключом.
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET не задан — секрет инстанса задаётся ЯВНО}
+    volumes:
+      #: Настройки монтируются ОДНИМ файлом: политику движков правит репозиторий, а не том, оставшийся от
+      #: прежнего запуска (иначе `keep_only` разошёлся бы с фактом).
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng-cache:/var/cache/searxng
+    networks: [platform]
+    mem_limit: 512m
+    #: Публикуем ТОЛЬКО на loopback: это нужно для хостовых проверок и ручных проб. Внутри сети служба
+    #: доступна по имени (`http://searxng:8080`), публикация для этого не нужна.
+    ports:
+      - "127.0.0.1:8090:8080"
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+    healthcheck:
+      #: Проверяем именно то, чем пользуется наш путь: JSON-поиск. «Порт открыт» ничего не доказывает.
+      test: ["CMD", "python", "-c", "import sys,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8080/search?q=health&format=json', timeout=15); sys.exit(0 if r.status==200 else 1)"]
+      interval: 60s
+      timeout: 25s
+      retries: 3
+      start_period: 30s
+
+  #: Обёртка поиска в MCP: превращает JSON-API SearXNG в MCP-инструменты (`searxng_web_search`,
+  #: `web_url_read`), которыми пользуются роли. Лимиты задаёт она.
+  mcp-searxng:
+    image: isokoliuk/mcp-searxng@sha256:ec0ca986ea9dde137607c44335b2e96a8e6a4d7876dee36198f406c34b35cbe0
+    restart: unless-stopped
+    environment:
+      #: Внутри сети — имя службы; наружу обёртка ходит только к нашему поиску.
+      SEARXNG_URL: http://searxng:8080
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: 3000
+      #: Лимиты — осознанные: умолчание обёртки (20 инициализаций сессии в минуту) мало для клиента,
+      #: который держит одну сессию на выпуск и допускает параллельные прогоны и ручные проверки.
+      MCP_RATE_WINDOW_MS: "60000"
+      MCP_RATE_INIT_MAX: "240"
+      MCP_RATE_SESSION_MAX: "1200"
+      #: Кеш поиска: повторный запрос не бьёт во внешние движки — вежливее к ним и снимает риск блокировки.
+      SEARCH_CACHE_MAX_ENTRIES: "200"
+      SEARCH_CACHE_TTL_MS: "600000"
+      SEARXNG_TIMEOUT_MS: "20000"
+      SEARXNG_MAX_RESULTS: "10"
+      SEARXNG_DEFAULT_LANGUAGE: "auto"
+      SEARXNG_DEFAULT_SAFESEARCH: "0"
+      NODE_ENV: production
+    networks: [platform]
+    depends_on: [searxng]
+    mem_limit: 256m
+    ports:
+      #: Публикуется только loopback: наружу обёртка не нужна.
+      - "127.0.0.1:3001:3000"
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "3"}
+    healthcheck:
+      #: Healthcheck нужен, потому что без него docker не отличает ЗАВИСШИЙ процесс от здорового:
+      #: `restart: unless-stopped` лечит только остановленный контейнер. Здесь достаточно кода ответа,
+      #: чтобы не зависеть от наличия `grep` в чужом образе.
+      test: ["CMD", "wget", "-qO-", "--timeout=5", "http://127.0.0.1:3000/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
